@@ -79,6 +79,65 @@ class QueryRequest(BaseModel):
     ] = None
 
 
+class CommonSampleRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_year: Annotated[int, Field(ge=YEAR_MIN, le=YEAR_MAX, description="起始年（含）")]
+    end_year: Annotated[int, Field(ge=YEAR_MIN, le=YEAR_MAX, description="结束年（含）")]
+    min_trees: Annotated[
+        int,
+        Field(ge=1, description="最低样本树数；年段内每年至少要有这么多棵树有值"),
+    ]
+
+    @model_validator(mode="after")
+    def _ordered_range(self) -> "CommonSampleRequest":
+        if self.start_year > self.end_year:
+            raise ValueError("start_year must be <= end_year")
+        return self
+
+
+class CommonSampleDefinitionOut(BaseModel):
+    coverage: str = (
+        "一棵树某年只要有任一根芯报了指数即算有值（0 也计入）；"
+        "树在某年没有任一根芯有值即视为断档"
+    )
+    segment: str = (
+        "年段内每一年都至少有 min_trees 棵树有值；取最长者，"
+        "同长取起始年较早者，起止年均计入"
+    )
+    consistency: str = "年段、树号和版号取自同一个已提交读快照"
+    index_only: str = (
+        "只读连续覆盖区间索引 tree_span 与版号，不逐年展开区间，"
+        "工作内存随 min_trees 增长"
+    )
+
+
+class CommonSampleResponse(BaseModel):
+    status: str = Field(description="'ok' 或 'no_solution'")
+    found: bool
+    start_year: int = Field(description="查询下界（含）")
+    end_year: int = Field(description="查询上界（含）")
+    min_trees: int
+    segment_start: int | None = Field(
+        default=None, description="最长连续年段的起始年（含）；无解时为 null"
+    )
+    segment_end: int | None = Field(
+        default=None, description="最长连续年段的结束年（含）；无解时为 null"
+    )
+    segment_length: int = Field(default=0, description="年段年数；无解时为 0")
+    tree_count: int = Field(default=0, description="完整覆盖该年段的树数")
+    trees: list[int] = Field(
+        default_factory=list, description="完整覆盖该年段的全部树号（升序）"
+    )
+    data_version: int = Field(description="查询所用已提交快照的数据版号")
+    definition: CommonSampleDefinitionOut = Field(
+        default_factory=CommonSampleDefinitionOut
+    )
+    read_cost: dict[str, int] = Field(
+        description="本次查询实际读取的索引行数/语句数"
+    )
+
+
 class DefinitionOut(BaseModel):
     inner: str = "对入选树，先取该树当年所有已报芯指数的中位数（株内中位数）"
     outer: str = "再对所有入选树的株内中位数取中位数，得到参考值"

@@ -57,3 +57,29 @@ curl -fsS -X POST "$BASE/reports" -H 'Content-Type: application/json' -d '{
 echo "== 3 trees left, excluding tree 3 leaves 2 -> insufficient =="
 curl -fsS "$BASE/chronology/1976" | json "d['sample_trees'], d['status'], d['value']"
 curl -fsS "$BASE/chronology/1976?exclude_tree=3" | json "d['sample_trees'], d['status'], d['value']"
+
+echo "== common sample 1975..1976: need all 5 trees -> only 1975 (1 and 2 lost 1976) =="
+curl -fsS "$BASE/common-sample?start_year=1975&end_year=1976&min_trees=5" \
+  | json "d['segment_start'], d['segment_end'], d['segment_length'], d['trees']"
+
+echo "== common sample 1975..1976, min_trees=3: trees 3,4,5 still cover both =="
+curl -fsS "$BASE/common-sample?start_year=1975&end_year=1976&min_trees=3" \
+  | json "d['segment_start'], d['segment_end'], d['segment_length'], d['trees']"
+
+echo "== re-report tree 4 to drop 1976 (whole-core replacement) =="
+curl -fsS -X POST "$BASE/reports" -H 'Content-Type: application/json' -d '{
+  "cores": [{"tree_no":4,"core_no":1,"years":{"1975":140}}]
+}' | json "d['data_version'], d['years_changed']"; echo
+
+echo "== after it, only trees 3 and 5 still cover both years (min_trees=2) =="
+curl -fsS "$BASE/common-sample?start_year=1975&end_year=1976&min_trees=2" \
+  | json "d['segment_start'], d['segment_end'], d['segment_length'], d['trees']"
+
+echo "== min_trees=3 now falls back to a 1-year segment at 1975 =="
+curl -fsS "$BASE/common-sample?start_year=1975&end_year=1976&min_trees=3" \
+  | json "d['segment_start'], d['segment_end'], d['segment_length'], d['trees']"
+
+echo "== an impossible minimum is an explicit no-solution (HTTP 404, found=false) =="
+code=$(curl -s -o /tmp/smoke_cs.json -w '%{http_code}' \
+  "$BASE/common-sample?start_year=1975&end_year=1976&min_trees=99")
+echo "status=$code"; cat /tmp/smoke_cs.json | json "d['status'], d['found'], d['segment_start'], d['trees']"

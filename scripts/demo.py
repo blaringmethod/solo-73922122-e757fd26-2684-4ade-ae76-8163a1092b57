@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Seed a tiny stand, query a year with/without one tree, re-report, query again.
+"""Seed a tiny stand, query years with/without one tree, then show how a
+whole-core re-report changes the common-sample answer.
 
 Usage:
     python scripts/demo.py [http://127.0.0.1:8000]
@@ -78,6 +79,34 @@ def main() -> int:
     status, low = call(base, "GET", "/chronology/1976?exclude_tree=5")
     status, low2 = call(base, "GET", "/chronology/1976?exclude_tree=2")
     show("1976 excluding tree 5", low)
+
+    # --- Common-sample query: same stand, before and after a re-report. ---
+    status, cs_before = call(
+        base, "GET", "/common-sample?start_year=1975&end_year=1976&min_trees=2"
+    )
+    show("common sample 1975..1976, min_trees=2 (before re-report)", cs_before)
+
+    status, low_before = call(
+        base, "GET", "/common-sample?start_year=1975&end_year=1976&min_trees=5"
+    )
+    show("common sample 1975..1976, min_trees=5 (before re-report)", low_before)
+
+    # Whole-core re-report of tree 5 that drops 1976: it no longer covers the
+    # two-year block, so a 5-tree common sample can only be 1975.
+    status, re5 = call(
+        base, "POST", "/reports", {"cores": [core(5, 1, {1975: 160})]}
+    )
+    print("\nre-report tree 5 core 1 without 1976:", status, re5)
+
+    status, cs_after = call(
+        base, "GET", "/common-sample?start_year=1975&end_year=1976&min_trees=2"
+    )
+    show("common sample 1975..1976, min_trees=2 (after re-report)", cs_after)
+
+    status, low_after = call(
+        base, "GET", "/common-sample?start_year=1975&end_year=1976&min_trees=5"
+    )
+    show("common sample 1975..1976, min_trees=5 (after re-report)", low_after)
     return 0
 
 

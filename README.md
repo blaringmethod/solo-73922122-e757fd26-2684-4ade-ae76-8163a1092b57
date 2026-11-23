@@ -30,6 +30,8 @@ TREERING_DB=./chronology.sqlite3 uvicorn app.main:app --port 8000
 | POST | `/reports` | 报送/重报若干根芯的逐年指数，**整根替换**，单事务 |
 | GET | `/chronology/{year}?exclude_tree=N` | 查参考值，可临时剔除树 N |
 | POST | `/chronology/query` | 同上，JSON 请求体 `{"year":…, "exclude_tree":…}` |
+| GET | `/common-sample?start_year=…&end_year=…&min_trees=…` | 共同样本：范围内最长连续年段 |
+| POST | `/common-sample` | 同上，JSON 请求体 |
 | GET | `/cores/{tree}/{core}` | 查看单根芯当前已提交的序列和修订号 |
 | GET | `/trees` | 已报送的树号 |
 | GET | `/health` | 健康检查 |
@@ -59,6 +61,67 @@ curl -X POST http://127.0.0.1:8000/reports -H 'Content-Type: application/json' -
    `value=null`，仍返回 `sample_trees` 供判断。
 5. 全程用整数做精确运算：`value_x4` 是参考值的 4 倍整数，`value = value_x4/4`
    （粒度 0.25），避免浮点误差。
+
+## 共同样本查询（同一批树比较历年轮宽）
+
+`GET /common-sample?start_year=1950&end_year=2000&min_trees=5`
+（或 `POST /common-sample`，请求体 `{"start_year":1950,"end_year":2000,"min_trees":5}`）
+
+在 `[start_year, end_year]`（**两端均含**）内找**最长连续年段** `[s, e]`，使得
+**至少有 `min_trees` 棵树在该段每一年的有值**；一棵树只有在整个 `[s, e]`
+每年都有值才算“完整覆盖”，才出现在返回的 `trees` 里。
+
+* **有值**：该树当年只要有任一根已报芯报了指数就算有值，**零值也计入**；
+  某年所有芯都没有值即为断档。
+* **并列**：年段同长时取**起始年较早**的一段。
+* **无解**：范围内不存在这样的年段时，返回 HTTP 404，响应体仍为完整结构：
+  `status="no_solution"`、`found=false`、`segment_start/segment_end=null`、
+  `segment_length=0`、`trees=[]`，并附带 `data_version`。
+* **同快照**：`segment_*`、`trees` 与 `data_version` 都取自同一个已提交读事务。
+
+示例响应：
+
+```json
+{
+  "status": "ok",
+  "found": true,
+  "start_year": 1950, "end_year": 2000, "min_trees": 5,
+  "segment_start": 1962, "segment_end": 1988, "segment_length": 27,
+  "tree_count": 7, "trees": [3, 4, 7, 11, 12, 19, 25],
+  "data_version": 42,
+  "read_cost": {"rows_read": 1841, "statements": 2, "slot_probes": 0}
+}
+```
+
+### 索引与复杂度
+
+写入时按树维护 `tree_span(tree_no, start_year, end_year)`：每棵树每段**极大连续有值年段**一行
+（不是每年一行）。整根重报时只重算受影响的树（同一事务内），并从 `tree_year` 派生，
+所以一棵树有 1000 年连续数据也只占 1 行。
+
+查询用一次按 `start_year` 的**流式扫描**（覆盖索引，按序号顺序，不排序、不逐年展开），
+维护一个大小恰为 `min_trees` 的最小堆：扫描到候选起点 `s` 时，堆顶就是“至少有
+`min_trees` 棵树能到的最远年份”，即该起点的最佳终点。随后用区间刺探索引
+（`tree_span_by_end`）一次性取出完整覆盖该段的树号。
+
+* 读取行数只随**区间数**增长，不随 `年数 × 树数` 增长；不逐年展开。
+* 除返回值外的工作内存只随 `min_trees` 增长（堆 + 常数）。
+* 实测（5,000 棵树、约 16.3 万个区间、200 年窗口）：
+
+  | min_trees | 读取索引行数 | 峰值额外内存 | 结果 |
+  | --- | --- | --- | --- |
+  | 1 | 163,083 | 4 KB | 57 年段、1 棵完整覆盖树 |
+  | 5,000 | 163,082 | 201 KB | 无解 |
+
+  查询连接由 SQLite authorizer 限制为**只能读** `tree_span` 与 `meta`；
+  `tree_year`/`year_stat`/`year_value_cum` 以及原始 `measurement`/`core`
+  在该连接上直接报 "access ... is prohibited"。
+
+### 已有数据卷升级
+
+`init_db` 启动时若发现 `meta.span_index_version` 缺失，会在一个事务里从
+`tree_year` 回填 `tree_span` 并写入标记；旧的命名卷 `docker compose up` 后
+无需手工迁移即可直接查询。回填中断（崩溃）则下次启动重试，不会留下半成品。
 
 ## 为什么查询是次线性的
 
@@ -101,21 +164,27 @@ curl -X POST http://127.0.0.1:8000/reports -H 'Content-Type: application/json' -
 * WAL 模式允许读不阻塞写；`busy_timeout` + 指数退避只对 `SQLITE_BUSY` 重试。
 * `meta.data_version` 每次成功报送 +1 并在响应中返回，可用来判断两次查询之间是否有写入。
 
-并发/回滚/快照一致性由 `tests/test_concurrency.py` 覆盖。
+并发/回滚/快照一致性由 `tests/test_concurrency.py` 与
+`tests/test_common_sample.py` 覆盖。
 
 ## 测试与试跑
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q                                # 21 个用例
-bash scripts/smoke.sh http://127.0.0.1:8000   # 需要已启动的服务
-python scripts/demo.py http://127.0.0.1:8000  # 打印完整示例响应
+pytest -q                                     # 45 个用例
+bash scripts/smoke.sh http://127.0.0.1:8000    # 需要已启动的服务
+python scripts/demo.py http://127.0.0.1:8000   # 打印完整示例响应
 ```
 
 测试覆盖：中位数（奇数/偶数、.5 精度）、逐树剔除、不足 3 树、整根替换丢年份、
 被剔除树当年无数据、校验失败、注入异常回滚、并发报送后聚合与原始明细一致、
 读期间快照版本一致、真实随机数据与暴力解对拍、原始表在查询连接上不可读、
 只读表结构中没有“逐树剔除后答案”列、查询计划无 SCAN、读取行数次线性。
+
+共同样本另有：最长年段与并列取早起、零值计入、任一芯有值即算覆盖、
+无解显式返回、整根重报后年段分裂、仅重算受影响树的索引、索引随报送事务回滚、
+旧数据卷自动回填、共同样本连接不可读年表/原始表、随机数据与暴力解对拍、
+读取行数随区间数而非年数×树数增长、额外内存随 `min_trees` 增长。
 
 ## 从 /docs 试查
 
@@ -127,3 +196,8 @@ python scripts/demo.py http://127.0.0.1:8000  # 打印完整示例响应
 5. 再次 `POST /reports` 只报 `{"tree_no":3,"core_no":1,"years":{"1975":121}}`（缺 1976），
    然后查 `1976`：该芯 1976 的数据已被替换掉。
 6. 把 `exclude_tree` 调到只剩 2 棵样本树，观察 `insufficient_samples`。
+7. 展开 `GET /common-sample` → `start_year=1975`、`end_year=1976`、`min_trees=2`
+   → *Execute*，记下 `segment_*` 与 `trees`。
+8. 再次 `POST /reports` 整根重报一棵树、去掉某一年（如
+   `{"tree_no":4,"core_no":1,"years":{"1975":140}}`），重复第 7 步：
+   共同样本年段/树号随之变化，`data_version` 递增。

@@ -188,6 +188,9 @@ def test_schema_stores_no_per_tree_excluded_answers(client, mods):
         "tree_year": {"year", "tree_no", "median_x2", "core_count"},
         "year_stat": {"year", "tree_count", "slot_count"},
         "year_value_cum": {"year", "slot", "value_x2", "cnt", "cum"},
+        # Continuous-coverage intervals for the common-sample query: only
+        # (tree, run) rows, never a per-year expansion nor a stored answer.
+        "tree_span": {"tree_no", "start_year", "end_year"},
     }
     conn = mods["db"].connect_read(mods["path"], restricted=False)
     try:

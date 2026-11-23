@@ -27,6 +27,18 @@ ALLOWED_READ_TABLES: frozenset[str] = frozenset(
     {"year_stat", "tree_year", "year_value_cum", "meta", "sqlite_master", "sqlite_temp_master"}
 )
 
+# The common-sample query may read *only* the continuous-coverage interval
+# index and the data version. It cannot reach the per-year chronology tables,
+# let alone the raw core/measurement tables.
+SPAN_READ_TABLES: frozenset[str] = frozenset(
+    {"tree_span", "meta", "sqlite_master", "sqlite_temp_master"}
+)
+
+# Bumped whenever the coverage-index layout changes. Its presence in ``meta``
+# means an existing data volume has already been backfilled.
+SPAN_INDEX_KEY = "span_index_version"
+SPAN_INDEX_VERSION = "1"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -92,6 +104,27 @@ CREATE TABLE IF NOT EXISTS year_value_cum (
     PRIMARY KEY (year, slot),
     UNIQUE (year, value_x2)
 ) WITHOUT ROWID;
+
+-- Continuous-coverage interval index for the common-sample query.
+--
+-- One row per maximal run of consecutive years in which a tree has at least
+-- one reported core value (a zero index still counts as a value). Runs are
+-- disjoint, so a tree contributes at most one row covering any given year.
+-- The common-sample query reads only this table; it never expands the runs
+-- into per-year rows and never touches tree_year/measurement.
+CREATE TABLE IF NOT EXISTS tree_span (
+    tree_no    INTEGER NOT NULL CHECK (tree_no >= 1),
+    start_year INTEGER NOT NULL CHECK (start_year BETWEEN 1 AND 9999),
+    end_year   INTEGER NOT NULL CHECK (end_year BETWEEN start_year AND 9999),
+    PRIMARY KEY (tree_no, start_year)
+) WITHOUT ROWID;
+
+-- Streaming order for the sweep: all intervals by their first year.
+CREATE INDEX IF NOT EXISTS tree_span_by_start
+    ON tree_span(start_year, end_year, tree_no);
+-- Interval stabbing for "which trees cover this whole segment".
+CREATE INDEX IF NOT EXISTS tree_span_by_end
+    ON tree_span(end_year, start_year, tree_no);
 """
 
 
@@ -109,10 +142,17 @@ def connect_write(path: str | os.PathLike[str]) -> sqlite3.Connection:
     return conn
 
 
-def _authorizer(action: int, arg1: str | None, arg2: str | None, dbname: str | None, trigger: str | None) -> int:
-    if action == sqlite3.SQLITE_READ and arg1 is not None and arg1 not in ALLOWED_READ_TABLES:
-        return sqlite3.SQLITE_DENY
-    return sqlite3.SQLITE_OK
+def _make_authorizer(allowed: frozenset[str]):
+    def _authorizer(action: int, arg1: str | None, arg2: str | None, dbname: str | None, trigger: str | None) -> int:
+        if action == sqlite3.SQLITE_READ and arg1 is not None and arg1 not in allowed:
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    return _authorizer
+
+
+_authorizer = _make_authorizer(ALLOWED_READ_TABLES)
+_span_authorizer = _make_authorizer(SPAN_READ_TABLES)
 
 
 @dataclass
@@ -154,11 +194,30 @@ class ReadSession:
         self.metrics.rows_read += len(rows)
         return rows
 
+    def iter_rows(self, sql: str, params: tuple[Any, ...] = ()) -> Iterator[sqlite3.Row]:
+        """Stream rows without materialising them (used by the span sweep).
 
-def connect_read(path: str | os.PathLike[str], *, restricted: bool = True) -> sqlite3.Connection:
+        Working memory of the caller therefore does not grow with the number
+        of index rows; only the rows the caller keeps count.
+        """
+        self.metrics.statements += 1
+        cursor = self.conn.execute(sql, params)
+        for row in cursor:
+            self.metrics.rows_read += 1
+            yield row
+
+
+def connect_read(
+    path: str | os.PathLike[str],
+    *,
+    restricted: bool = True,
+    span_only: bool = False,
+) -> sqlite3.Connection:
     """Open a read-only connection.
 
     ``restricted=True`` installs the authorizer used by the reference endpoint.
+    ``span_only=True`` installs the stricter authorizer used by the
+    common-sample endpoint (continuous-coverage index + data version only).
     ``restricted=False`` is used only by administrative read endpoints (e.g. a
     core's raw series) and by health checks.
     """
@@ -167,15 +226,22 @@ def connect_read(path: str | os.PathLike[str], *, restricted: bool = True) -> sq
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA query_only=ON")
-    if restricted:
+    if span_only:
+        conn.set_authorizer(_span_authorizer)
+    elif restricted:
         conn.set_authorizer(_authorizer)
     return conn
 
 
 @contextmanager
-def read_snapshot(path: str | os.PathLike[str], *, restricted: bool = True) -> Iterator[ReadSession]:
+def read_snapshot(
+    path: str | os.PathLike[str],
+    *,
+    restricted: bool = True,
+    span_only: bool = False,
+) -> Iterator[ReadSession]:
     """Yield one consistent read snapshot; always rolls back on exit."""
-    conn = connect_read(path, restricted=restricted)
+    conn = connect_read(path, restricted=restricted, span_only=span_only)
     try:
         conn.execute("BEGIN")
         yield ReadSession(conn)
@@ -187,19 +253,74 @@ def read_snapshot(path: str | os.PathLike[str], *, restricted: bool = True) -> I
 
 
 def init_db(path: str | os.PathLike[str]) -> None:
-    """Create the schema if needed and ensure WAL mode."""
+    """Create the schema if needed, ensure WAL mode, and upgrade old volumes."""
     p = _db_path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(p), timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA busy_timeout=30000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA)
+        _ensure_span_index(conn)
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         conn.close()
+
+
+def _ensure_span_index(conn: sqlite3.Connection) -> None:
+    """Backfill ``tree_span`` once for a data volume created before it existed.
+
+    The backfill runs in a single transaction and derives the runs from
+    ``tree_year`` (which already has one row per tree and year with data),
+    so an existing volume becomes queryable immediately after the upgrade.
+    New databases created by this version also pass through here once, with
+    an empty ``tree_year``. The marker is written only on success, so a crash
+    mid-backfill simply retries next start.
+    """
+    row = conn.execute(
+        "SELECT value FROM meta WHERE key=?", (SPAN_INDEX_KEY,)
+    ).fetchone()
+    if row is not None and row["value"] == SPAN_INDEX_VERSION:
+        return
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        # Re-check under the write lock: two containers may start at once, and
+        # only the first should backfill.
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key=?", (SPAN_INDEX_KEY,)
+        ).fetchone()
+        if row is not None and row["value"] == SPAN_INDEX_VERSION:
+            conn.execute("COMMIT")
+            return
+        conn.execute("DELETE FROM tree_span")
+        conn.execute(
+            """
+            INSERT INTO tree_span(tree_no, start_year, end_year)
+            SELECT tree_no, MIN(year), MAX(year)
+            FROM (
+                SELECT tree_no, year,
+                       year - ROW_NUMBER() OVER (
+                           PARTITION BY tree_no ORDER BY year
+                       ) AS grp
+                FROM tree_year
+            )
+            GROUP BY tree_no, grp
+            """
+        )
+        conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (SPAN_INDEX_KEY, SPAN_INDEX_VERSION),
+        )
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
 
 
 def read_data_version(path: str | os.PathLike[str]) -> int:

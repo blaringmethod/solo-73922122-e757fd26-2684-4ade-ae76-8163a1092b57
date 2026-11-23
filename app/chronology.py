@@ -20,6 +20,7 @@ subtracts that one tree's median from the counts on the fly; no per-tree
 
 from __future__ import annotations
 
+import heapq
 import sqlite3
 from datetime import datetime, timezone
 
@@ -112,6 +113,37 @@ def _rebuild_year(conn: sqlite3.Connection, year: int) -> None:
     )
 
 
+def _rebuild_tree_span(conn: sqlite3.Connection, tree_no: int) -> None:
+    """Recompute one tree's maximal consecutive-coverage runs.
+
+    A tree covers a year when ``tree_year`` has a row for it (at least one core
+    reported a value that year; zero counts). A single pass over the tree's
+    years groups adjacent integers into maximal runs; only that tree's rows are
+    touched, so a whole-core re-report costs O(years of that tree).
+    """
+    conn.execute("DELETE FROM tree_span WHERE tree_no=?", (tree_no,))
+    rows = conn.execute(
+        "SELECT year FROM tree_year WHERE tree_no=? ORDER BY year", (tree_no,)
+    ).fetchall()
+    spans: list[tuple[int, int, int]] = []
+    start: int | None = None
+    prev: int | None = None
+    for row in rows:
+        year = int(row["year"])
+        if prev is None or year != prev + 1:
+            if start is not None:
+                spans.append((tree_no, start, prev))
+            start = year
+        prev = year
+    if start is not None:
+        spans.append((tree_no, start, prev))
+    if spans:
+        conn.executemany(
+            "INSERT INTO tree_span(tree_no, start_year, end_year) VALUES(?,?,?)",
+            spans,
+        )
+
+
 def _apply_report_tx(conn: sqlite3.Connection, request: ReportRequest) -> dict[str, int]:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     new_version = _meta_int(conn, "data_version") + 1
@@ -175,6 +207,11 @@ def _apply_report_tx(conn: sqlite3.Connection, request: ReportRequest) -> dict[s
 
     for year in sorted(affected_years):
         _rebuild_year(conn, year)
+
+    # Refresh the continuous-coverage index for exactly the touched trees.
+    # This happens in the same transaction as the measurements and aggregates.
+    for tree_no in sorted(touched_trees):
+        _rebuild_tree_span(conn, tree_no)
 
     _set_meta_int(conn, "data_version", new_version)
 
@@ -336,6 +373,135 @@ def query_reference(db_path: str, year: int, exclude_tree: int | None) -> dict:
         "excluded_tree_median_x2": excluded_value_x2,
         "data_version": data_version,
         "read_cost": metrics.as_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Common-sample (continuous coverage) query
+# ---------------------------------------------------------------------------
+
+
+def query_common_sample(
+    db_path: str, start_year: int, end_year: int, min_trees: int
+) -> dict:
+    """Longest span in ``[start_year, end_year]`` covered by >= ``min_trees``.
+
+    Each tree contributes disjoint maximal coverage intervals (``tree_span``).
+    A tree covers a segment ``[s, e]`` iff one of its intervals has
+    ``start <= s`` and ``end >= e``; the runs are disjoint, so at most one
+    interval per tree can match and counting intervals counts trees.
+
+    Sweep intervals in ascending ``start`` while keeping a min-heap of the
+    ``min_trees`` largest ``end`` values seen so far.  At candidate start
+    ``s`` the heap root is the ``min_trees``-th largest end, i.e. the furthest
+    year reached by at least ``min_trees`` trees: the best end for that start.
+    The sweep only touches the interval index (one streamed pass, no per-year
+    expansion) and the heap occupies O(min_trees) memory.  The winning segment
+    is then resolved to tree numbers with one interval-stabbing read.
+
+    The whole function runs inside one deferred read transaction, so segment,
+    tree list and data version all come from the same committed snapshot even
+    while reports keep landing.
+    """
+    best: tuple[int, int, int] | None = None  # (length, start, end)
+
+    with read_snapshot(db_path, restricted=False, span_only=True) as session:
+        heap: list[int] = []
+
+        def consider(s_year: int) -> None:
+            nonlocal best
+            if len(heap) < min_trees:
+                return
+            reach = heap[0]  # min_trees-th largest end among starts <= s_year
+            if reach < s_year:
+                return
+            e_year = min(reach, end_year)
+            if e_year < s_year:
+                return
+            length = e_year - s_year + 1
+            # Equal length keeps the earlier start, so update only if longer.
+            if best is None or length > best[0]:
+                best = (length, s_year, e_year)
+
+        # The sweep key must always be >= start_year before it is evaluated.
+        current = start_year
+        for row in session.iter_rows(
+            "SELECT start_year, end_year FROM tree_span "
+            "ORDER BY start_year, end_year"
+        ):
+            s_year = int(row["start_year"])
+            e_year = int(row["end_year"])
+            if s_year > end_year:
+                break
+            if s_year < start_year:
+                # Interval starts before the window: it still reaches into it
+                # (or does not reach at all).
+                if e_year >= start_year:
+                    if len(heap) < min_trees:
+                        heapq.heappush(heap, e_year)
+                    elif e_year > heap[0]:
+                        heapq.heapreplace(heap, e_year)
+                continue
+            if s_year != current:
+                consider(current)
+                current = s_year
+            if len(heap) < min_trees:
+                heapq.heappush(heap, e_year)
+            elif e_year > heap[0]:
+                heapq.heapreplace(heap, e_year)
+
+        # The final sweep key (and, when there were no intervals at all, the
+        # window's own start) is evaluated with whatever the heap holds.
+        consider(current)
+
+        if best is None:
+            version = session.fetchone(
+                "SELECT value FROM meta WHERE key='data_version'"
+            )
+            data_version = int(version["value"]) if version is not None else 0
+            return {
+                "status": "no_solution",
+                "found": False,
+                "start_year": start_year,
+                "end_year": end_year,
+                "min_trees": min_trees,
+                "segment_start": None,
+                "segment_end": None,
+                "segment_length": 0,
+                "tree_count": 0,
+                "trees": [],
+                "data_version": data_version,
+                "read_cost": session.metrics.as_dict(),
+            }
+
+        length, seg_start, seg_end = best
+        trees: list[int] = []
+        for row in session.iter_rows(
+            "SELECT tree_no FROM tree_span INDEXED BY tree_span_by_end "
+            "WHERE start_year <= ? AND end_year >= ? ORDER BY tree_no",
+            (seg_start, seg_end),
+        ):
+            tree_no = int(row["tree_no"])
+            if not trees or trees[-1] != tree_no:
+                trees.append(tree_no)
+
+        version = session.fetchone("SELECT value FROM meta WHERE key='data_version'")
+        data_version = int(version["value"]) if version is not None else 0
+        read_cost = session.metrics.as_dict()
+
+    return {
+        "status": "ok",
+        "found": True,
+        "start_year": start_year,
+        "end_year": end_year,
+        "min_trees": min_trees,
+        "segment_start": seg_start,
+        "segment_end": seg_end,
+        "segment_length": length,
+        "tree_count": len(trees),
+        "trees": trees,
+        "data_version": data_version,
+        "read_cost": read_cost,
     }
 
 
